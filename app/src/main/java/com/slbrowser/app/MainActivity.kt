@@ -21,6 +21,7 @@ import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
+import android.widget.FrameLayout
 import android.widget.EditText
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
@@ -34,7 +35,12 @@ import java.util.Date
 import java.util.Locale
 
 class MainActivity : Activity() {
-    private lateinit var web: WebView
+    private val tabViews = mutableListOf<WebView>()
+    private val tabTitles = mutableListOf<String>()
+    private var currentTab = 0
+    private val web: WebView get() = tabViews[currentTab]
+    private lateinit var webContainer: FrameLayout
+    private var fileChooserCallback: android.webkit.ValueCallback<Array<Uri>>? = null
     private lateinit var address: EditText
     private lateinit var status: TextView
     private lateinit var root: LinearLayout
@@ -49,9 +55,9 @@ class MainActivity : Activity() {
         history.addAll(readList("history"))
         bookmarks.addAll(readList("bookmarks"))
         buildInterface()
-        configureWebView()
         val last = prefs.getString("last_url", null)
-        web.loadUrl(last ?: "https://www.google.com")
+        // The first tab is created by buildInterface; load the last visited page.
+        if (!last.isNullOrBlank()) web.loadUrl(last)
     }
 
     private fun buildInterface() {
@@ -87,16 +93,17 @@ class MainActivity : Activity() {
 
         val nav = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
         val navRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        navRow.addView(makeButton("Back", 82) { if (web.canGoBack()) web.goBack() })
-        navRow.addView(makeButton("Forward", 94) { if (web.canGoForward()) web.goForward() })
+        navRow.addView(makeButton("Back", 82) { if (web.canGoBack()) web.goBack() else toast("No previous page") })
+        navRow.addView(makeButton("Forward", 94) { if (web.canGoForward()) web.goForward() else toast("No next page") })
         navRow.addView(makeButton("History", 88) { showHistory() })
         navRow.addView(makeButton("Bookmarks", 112) { showBookmarks() })
         navRow.addView(makeButton("Downloads", 112) { showDownloadsInfo() })
         nav.addView(navRow)
         root.addView(nav)
 
-        web = WebView(this)
-        root.addView(web, LinearLayout.LayoutParams(MATCH, 0, 1f))
+        webContainer = FrameLayout(this)
+        root.addView(webContainer, LinearLayout.LayoutParams(MATCH, 0, 1f))
+        createTab("https://www.google.com", switchTo = true)
 
         status = TextView(this).apply {
             text = "Ready"
@@ -119,8 +126,8 @@ class MainActivity : Activity() {
         setContentView(root)
     }
 
-    private fun configureWebView() {
-        web.settings.apply {
+    private fun configureWebView(view: WebView) {
+        view.settings.apply {
             javaScriptEnabled = true
             domStorageEnabled = true
             databaseEnabled = true
@@ -136,22 +143,64 @@ class MainActivity : Activity() {
             userAgentString = WebSettings.getDefaultUserAgent(this@MainActivity)
         }
         CookieManager.getInstance().setAcceptCookie(true)
-        CookieManager.getInstance().setAcceptThirdPartyCookies(web, true)
-        web.addJavascriptInterface(PageBridge(), "SlBrowserBridge")
-        web.webViewClient = object : WebViewClient() {
-            override fun onPageFinished(view: WebView?, url: String?) {
-                super.onPageFinished(view, url)
-                if (!url.isNullOrBlank()) {
-                    address.setText(url)
-                    prefs.edit().putString("last_url", url).apply()
+        CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
+        view.addJavascriptInterface(PageBridge(), "SlBrowserBridge")
+        view.webViewClient = object : WebViewClient() {
+            override fun onPageFinished(v: WebView?, url: String?) {
+                super.onPageFinished(v, url)
+                val index = tabViews.indexOf(view)
+                if (index >= 0 && !url.isNullOrBlank()) {
+                    tabTitles[index] = view.title?.takeIf { it.isNotBlank() } ?: url
+                    if (index == currentTab) {
+                        address.setText(url)
+                        prefs.edit().putString("last_url", url).apply()
+                        status.text = view.title ?: url
+                        if (autoSelect) injectAutoSelect()
+                    }
                     addHistory(url)
-                    status.text = view?.title ?: url
-                    if (autoSelect) injectAutoSelect()
                 }
             }
         }
-        web.webChromeClient = WebChromeClient()
-        web.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+        view.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                webView: WebView?,
+                callback: android.webkit.ValueCallback<Array<Uri>>?,
+                params: FileChooserParams?
+            ): Boolean {
+                fileChooserCallback?.onReceiveValue(null)
+                fileChooserCallback = callback
+                return try {
+                    val intent = params?.createIntent() ?: Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE)
+                        type = "*/*"
+                    }
+                    if (params?.mode == FileChooserParams.MODE_OPEN_MULTIPLE) {
+                        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                    }
+                    startActivityForResult(intent, fileRequest)
+                    true
+                } catch (_: Exception) {
+                    fileChooserCallback?.onReceiveValue(null)
+                    fileChooserCallback = null
+                    toast("Unable to open device files")
+                    false
+                }
+            }
+
+            override fun onCreateWindow(v: WebView?, isDialog: Boolean, isUserGesture: Boolean, resultMsg: android.os.Message?): Boolean {
+                val newView = createTab("about:blank", switchTo = true)
+                val transport = resultMsg?.obj as? WebView.WebViewTransport ?: return false
+                transport.webView = newView
+                resultMsg?.sendToTarget()
+                return true
+            }
+
+            override fun onReceivedTitle(v: WebView?, title: String?) {
+                val index = tabViews.indexOf(view)
+                if (index >= 0 && !title.isNullOrBlank()) tabTitles[index] = title
+            }
+        }
+        view.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             try {
                 val request = DownloadManager.Request(Uri.parse(url))
                     .setMimeType(mimeType)
@@ -162,6 +211,49 @@ class MainActivity : Activity() {
                 toast("Download started")
             } catch (_: Exception) { toast("Unable to start download") }
         })
+    }
+
+    private fun createTab(url: String, switchTo: Boolean): WebView {
+        val view = WebView(this)
+        tabViews.add(view)
+        tabTitles.add("New tab")
+        configureWebView(view)
+        if (switchTo || tabViews.size == 1) {
+            currentTab = tabViews.lastIndex
+            webContainer.removeAllViews()
+            webContainer.addView(view, FrameLayout.LayoutParams(MATCH, MATCH))
+            if (::address.isInitialized) address.setText(if (url == "about:blank") "" else url)
+        }
+        if (url != "about:blank") view.loadUrl(url)
+        return view
+    }
+
+    private fun switchTab(index: Int) {
+        if (index !in tabViews.indices) return
+        currentTab = index
+        webContainer.removeAllViews()
+        webContainer.addView(web, FrameLayout.LayoutParams(MATCH, MATCH))
+        address.setText(web.url ?: "")
+        status.text = tabTitles[index]
+        updateNavigationButtons()
+    }
+
+    private fun closeTab(index: Int) {
+        if (tabViews.size <= 1) {
+            web.loadUrl("https://www.google.com")
+            return
+        }
+        val closing = tabViews.removeAt(index)
+        tabTitles.removeAt(index)
+        closing.stopLoading()
+        closing.destroy()
+        if (index < currentTab) currentTab--
+        else if (index == currentTab) currentTab = minOf(index, tabViews.lastIndex)
+        switchTab(currentTab)
+    }
+
+    private fun updateNavigationButtons() {
+        // Back and Forward remain clickable; their actions safely check WebView history.
     }
 
     private fun makeButton(label: String, minWidthDp: Int, heightDp: Int, action: () -> Unit): Button =
@@ -195,7 +287,7 @@ class MainActivity : Activity() {
         val items = arrayOf("New Tab", "Desktop Site", "Mobile Site", "Bookmarks", "History", "Downloads", "Settings", "Reload")
         AlertDialog.Builder(this).setTitle("SlBrowser Menu").setItems(items) { _, which ->
             when (which) {
-                0 -> web.loadUrl("https://www.google.com")
+                0 -> createTab("https://www.google.com", switchTo = true)
                 1 -> setDesktopMode(true)
                 2 -> setDesktopMode(false)
                 3 -> showBookmarks()
@@ -238,9 +330,20 @@ class MainActivity : Activity() {
     }
 
     private fun showTabs() {
-        AlertDialog.Builder(this).setTitle("Tabs")
-            .setMessage("1 active tab\\n\\nMulti-tab WebView management will be added in a later milestone.")
-            .setPositiveButton("OK", null).show()
+        val labels = tabViews.indices.map { i ->
+            "${if (i == currentTab) "✓ " else ""}${i + 1}. ${tabTitles[i].take(45)}"
+        }.toMutableList()
+        labels.add("＋ New tab")
+        AlertDialog.Builder(this).setTitle("Tabs (${tabViews.size})")
+            .setItems(labels.toTypedArray()) { _, which ->
+                if (which == tabViews.size) createTab("https://www.google.com", true)
+                else {
+                    val actions = arrayOf("Open this tab", "Close this tab")
+                    AlertDialog.Builder(this).setTitle(labels[which]).setItems(actions) { _, action ->
+                        if (action == 0) switchTab(which) else closeTab(which)
+                    }.show()
+                }
+            }.setNegativeButton("Done", null).show()
     }
 
     private fun showHistory() = showUrlList("History", history.asReversed(), false)
@@ -269,18 +372,52 @@ class MainActivity : Activity() {
     }
 
     private fun showDownloadsInfo() {
+        val manager = getSystemService(DOWNLOAD_SERVICE) as DownloadManager
+        val cursor = manager.query(DownloadManager.Query())
+        val rows = mutableListOf<Pair<Long, String>>()
+        cursor?.use {
+            val idCol = it.getColumnIndex(DownloadManager.COLUMN_ID)
+            val titleCol = it.getColumnIndex(DownloadManager.COLUMN_TITLE)
+            val statusCol = it.getColumnIndex(DownloadManager.COLUMN_STATUS)
+            while (it.moveToNext()) {
+                val id = it.getLong(idCol)
+                val title = it.getString(titleCol) ?: "Download"
+                val state = when (it.getInt(statusCol)) {
+                    DownloadManager.STATUS_SUCCESSFUL -> "Completed"
+                    DownloadManager.STATUS_FAILED -> "Failed"
+                    DownloadManager.STATUS_RUNNING -> "Downloading"
+                    DownloadManager.STATUS_PAUSED -> "Paused"
+                    else -> "Pending"
+                }
+                rows.add(id to "$title — $state")
+            }
+        }
+        if (rows.isEmpty()) { toast("No downloads yet"); return }
         AlertDialog.Builder(this).setTitle("Downloads")
-            .setMessage("Downloads are saved in the device Downloads folder. Android Download Manager handles transfer notifications.")
-            .setPositiveButton("OK", null).show()
+            .setItems(rows.map { it.second }.toTypedArray()) { _, which ->
+                val id = rows[which].first
+                try {
+                    startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
+                } catch (_: Exception) { toast("Open Downloads from device file manager") }
+            }.setNegativeButton("Close", null).show()
     }
 
     private fun chooseFiles() {
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "*/*"
-            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+        web.evaluateJavascript("""
+            (function(){
+              const inputs=[...document.querySelectorAll('input[type=file]:not(:disabled)')];
+              if(!inputs.length) return 'NO_FILE_INPUT';
+              const shown=inputs.filter(el=>{const r=el.getBoundingClientRect();return r.width>0&&r.height>0;});
+              (shown[shown.length-1]||inputs[inputs.length-1]).click();
+              return 'OPENED';
+            })()
+        """.trimIndent()) { result ->
+            when (result?.trim('"')) {
+                "NO_FILE_INPUT" -> toast("This page has no file upload field")
+                "OPENED" -> status.text = "Select a file to upload"
+                else -> toast("Could not open website upload")
+            }
         }
-        startActivityForResult(intent, fileRequest)
     }
 
     @Deprecated("Legacy result callback retained for broad Android compatibility")
@@ -299,42 +436,44 @@ class MainActivity : Activity() {
             }
             return
         }
-        if (requestCode == fileRequest && resultCode == RESULT_OK && data != null) {
-            val uris = mutableListOf<Uri>()
-            data.clipData?.let { clip -> for (i in 0 until clip.itemCount) uris.add(clip.getItemAt(i).uri) }
-            data.data?.let { if (!uris.contains(it)) uris.add(it) }
-            if (uris.isNotEmpty()) {
-                // The selected documents are reported here. A full WebChromeClient
-                // file chooser bridge is planned for the next implementation stage.
-                toast("${uris.size} file(s) selected. Website upload integration is the next stage.")
-            }
+        if (requestCode == fileRequest) {
+            val callback = fileChooserCallback
+            fileChooserCallback = null
+            val result = if (resultCode == RESULT_OK && data != null)
+                WebChromeClient.FileChooserParams.parseResult(resultCode, data) else null
+            callback?.onReceiveValue(result)
+            if (result != null && result.isNotEmpty()) status.text = "File selected for website upload"
+            else if (resultCode != RESULT_OK) status.text = "File selection cancelled"
+            return
         }
     }
 
     private fun answerDialog() {
-        val input = EditText(this).apply {
-            hint = "Type your message"
-            minLines = 3
-            gravity = Gravity.TOP
+        web.evaluateJavascript("""
+            (function(){
+              const visible=e=>{if(!e||e.disabled)return false;const r=e.getBoundingClientRect();return r.width>0&&r.height>0;};
+              const editors=[...document.querySelectorAll('textarea:not(:disabled),input[type=text]:not(:disabled),[contenteditable=true],[role=textbox]')].filter(visible);
+              const active=document.activeElement;
+              let editor=editors.includes(active)?active:null;
+              if(!editor) editor=[...editors].reverse().find(e=>(e.innerText||e.value||'').trim().length>0);
+              if(!editor)return 'NO_FIELD';
+              if(!(editor.innerText||editor.value||'').trim())return 'EMPTY';
+              const form=editor.closest('form');
+              const rx=/send|submit|ارسال|فرستادن/i;
+              let btn=form?[...form.querySelectorAll('button,[role=button],input[type=submit]')].filter(visible).find(e=>rx.test([e.innerText,e.textContent,e.getAttribute('aria-label'),e.title,e.value].join(' '))):null;
+              if(!btn){let p=editor.parentElement;for(let i=0;p&&i<5&&!btn;i++,p=p.parentElement)btn=[...p.querySelectorAll('button,[role=button]')].filter(visible).find(e=>rx.test([e.innerText,e.textContent,e.getAttribute('aria-label'),e.title].join(' ')));}
+              if(btn){btn.click();return 'SENT';}
+              if(form&&form.requestSubmit){form.requestSubmit();return 'SENT';}
+              return 'NO_SEND';
+            })()
+        """.trimIndent()) { result ->
+            when (result?.trim('"')) {
+                "SENT" -> { status.text = "Website send action activated"; toast("Send") }
+                "EMPTY" -> toast("Write a message first")
+                "NO_FIELD" -> toast("No message field found")
+                else -> toast("Website Send button not found")
+            }
         }
-        AlertDialog.Builder(this).setTitle("Answer").setView(input)
-            .setPositiveButton("Send") { _, _ ->
-                val message = input.text.toString()
-                if (message.isNotBlank()) {
-                    val quoted = JSONObject.quote(message)
-                    web.evaluateJavascript("""
-                        (function(){
-                          const el=document.querySelector('textarea, [contenteditable="true"], input[type="text"]');
-                          if(!el) return 'No editable message field found';
-                          el.focus();
-                          if(el.isContentEditable){el.textContent=$quoted;}
-                          else {const setter=Object.getOwnPropertyDescriptor(el.constructor.prototype,'value')?.set; if(setter) setter.call(el,$quoted); else el.value=$quoted;}
-                          el.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:$quoted}));
-                          return 'Message inserted. Review and press the website Send button.';
-                        })()
-                    """.trimIndent()) { result -> status.text = result?.trim('"') ?: "Message inserted" }
-                }
-            }.setNegativeButton("Cancel", null).show()
     }
 
     private fun savePageText() {
@@ -444,11 +583,16 @@ class MainActivity : Activity() {
     private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 
     override fun onBackPressed() {
-        if (web.canGoBack()) web.goBack() else super.onBackPressed()
+        if (web.canGoBack()) web.goBack()
+        else if (tabViews.size > 1) closeTab(currentTab)
+        else super.onBackPressed()
     }
 
     override fun onDestroy() {
-        prefs.edit().putString("last_url", web.url).apply()
+        fileChooserCallback?.onReceiveValue(null)
+        fileChooserCallback = null
+        if (tabViews.isNotEmpty()) prefs.edit().putString("last_url", web.url).apply()
+        tabViews.forEach { it.stopLoading(); it.destroy() }
         super.onDestroy()
     }
 }
