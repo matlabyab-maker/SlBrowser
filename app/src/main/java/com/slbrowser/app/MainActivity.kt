@@ -9,9 +9,17 @@ import android.os.Build
 import android.webkit.MimeTypeMap
 import android.content.Context
 import android.content.Intent
+import android.content.ContentValues
+import android.provider.MediaStore
+import android.util.Base64
+import java.io.File
+import java.io.FileOutputStream
+import java.io.BufferedInputStream
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.Environment
 import android.view.Gravity
 import android.view.View
@@ -36,6 +44,10 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import com.yausername.youtubedl_android.YoutubeDL
+import com.yausername.youtubedl_android.YoutubeDLRequest
+import com.yausername.youtubedl_android.FFmpeg
+import com.yausername.youtubedl_android.YoutubeDLException
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -53,6 +65,16 @@ class MainActivity : Activity() {
     private var desktopMode = false
     private data class PendingDownload(val url: String, val userAgent: String?, val disposition: String?, val mimeType: String?)
     private var pendingDownload: PendingDownload? = null
+    private data class VideoCandidate(val url: String, val title: String, val mime: String, val kind: String)
+    private val videoCandidates = linkedMapOf<String, VideoCandidate>()
+    private val videoBlinkHandler = Handler(Looper.getMainLooper())
+    private var videoBlinking = false
+    private lateinit var videoLinksButton: Button
+    private var blobTempFile: File? = null
+    private var blobOutput: FileOutputStream? = null
+    private var blobDisplayName: String = "download.bin"
+    private var blobMimeType: String = "application/octet-stream"
+    private var blobBytes: Long = 0L
     private var fileChooserCallback: android.webkit.ValueCallback<Array<Uri>>? = null
     private lateinit var address: EditText
     private lateinit var status: TextView
@@ -70,6 +92,12 @@ class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        try {
+            YoutubeDL.getInstance().init(this)
+            FFmpeg.getInstance().init(this)
+        } catch (e: Exception) {
+            android.util.Log.e("SlBrowser", "Video extractor initialization failed", e)
+        }
         history.addAll(readList("history"))
         desktopMode = prefs.getBoolean("desktop_mode", false)
         bookmarks.addAll(readList("bookmarks"))
@@ -88,7 +116,7 @@ class MainActivity : Activity() {
         val header = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(8, 8, 8, 6)
+            setPadding(8, 1, 8, 0)
         }
         header.addView(TextView(this).apply {
             text = "SlBrowser"
@@ -114,6 +142,7 @@ class MainActivity : Activity() {
         navBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
+            setPadding(0, 0, 0, 0)
         }
         val navItems = listOf(
             "Back" to { if (web.canGoBack()) web.goBack() else toast("No previous page") },
@@ -159,10 +188,12 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
             setPadding(5, 5, 5, 7)
         }
-        bottom.addView(makeButton("Auto Select", 1, 64) { toggleAutoSelect() }, LinearLayout.LayoutParams(0, dp(64), 1.05f).apply { setMargins(2, 0, 2, 0) })
+        bottom.addView(makeButton("Auto Select", 1, 64) { toggleAutoSelect() }, LinearLayout.LayoutParams(0, dp(64), 0.95f).apply { setMargins(2, 0, 2, 0) })
         bottom.addView(makeButton("Save", 1, 64) { savePageText() }, LinearLayout.LayoutParams(0, dp(64), 0.9f).apply { setMargins(2, 0, 2, 0) })
         bottom.addView(makeButton("File", 1, 64) { chooseFiles() }, LinearLayout.LayoutParams(0, dp(64), 0.9f).apply { setMargins(2, 0, 2, 0) })
-        bottom.addView(makeButton("Answer", 1, 64) { answerDialog() }, LinearLayout.LayoutParams(0, dp(64), 1.15f).apply { setMargins(2, 0, 2, 0) })
+        bottom.addView(makeButton("Answer", 1, 64) { answerDialog() }, LinearLayout.LayoutParams(0, dp(64), 1.0f).apply { setMargins(2, 0, 2, 0) })
+        videoLinksButton = makeButton("Video Links", 1, 64) { showVideoLinks() }
+        bottom.addView(videoLinksButton, LinearLayout.LayoutParams(0, dp(64), 1.1f).apply { setMargins(2, 0, 2, 0) })
         bottomBar = bottom
         root.addView(bottom)
         setContentView(root)
@@ -187,6 +218,8 @@ class MainActivity : Activity() {
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
         view.addJavascriptInterface(PageBridge(), "SlBrowserBridge")
+        view.addJavascriptInterface(DownloadBridge(), "SlBrowserDownloadBridge")
+        view.addJavascriptInterface(VideoScanBridge(), "SlBrowserVideoBridge")
         view.webViewClient = object : WebViewClient() {
             override fun shouldOverrideUrlLoading(v: WebView?, request: android.webkit.WebResourceRequest?): Boolean {
                 if (request?.isForMainFrame != true) return false
@@ -222,7 +255,24 @@ class MainActivity : Activity() {
                         if (autoSelect) injectAutoSelect()
                     }
                     addHistory(url)
+                    installGeneratedDownloadCapture(view)
+                    scanPageForVideos(view)
+                    view.postDelayed(object : Runnable {
+                        override fun run() {
+                            if (!view.isDestroyed && view.url == url) {
+                                scanPageForVideos(view)
+                                view.postDelayed(this, 2500)
+                            }
+                        }
+                    }, 2500)
                 }
+            }
+            override fun shouldInterceptRequest(v: WebView?, request: android.webkit.WebResourceRequest?): android.webkit.WebResourceResponse? {
+                val u = request?.url?.toString() ?: return null
+                val lower = u.lowercase(Locale.ROOT)
+                val path = Uri.parse(u).path?.lowercase(Locale.ROOT).orEmpty()
+                if (isVideoResource(lower, path)) addVideoCandidate(u, "Video stream", request?.requestHeaders?.get("Accept") ?: "", videoKind(u))
+                return super.shouldInterceptRequest(v, request)
             }
         }
         view.webChromeClient = object : WebChromeClient() {
@@ -279,8 +329,233 @@ class MainActivity : Activity() {
         })
         view.setOnTouchListener { _, event -> pinch.onTouchEvent(event); false }
         view.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
-            startDownload(PendingDownload(url, userAgent, contentDisposition, mimeType))
+            val parsed = Uri.parse(url)
+            when (parsed.scheme?.lowercase(Locale.ROOT)) {
+                "blob", "data" -> downloadPageGeneratedUrl(view, url, contentDisposition, mimeType)
+                "http", "https" -> startDownload(PendingDownload(url, userAgent, contentDisposition, mimeType))
+                "content", "file" -> copyLocalUriToDownloads(parsed, contentDisposition, mimeType)
+                else -> toast("Unsupported download link type")
+            }
         })
+    }
+
+    private fun isVideoResource(url: String, path: String): Boolean {
+        return listOf(".mp4", ".m4v", ".webm", ".mov", ".mkv", ".3gp", ".ts", ".m3u8", ".mpd", ".ism/manifest")
+            .any { path.contains(it) || url.contains(it) }
+    }
+
+    private fun videoKind(url: String): String {
+        val p = Uri.parse(url).path?.lowercase(Locale.ROOT).orEmpty()
+        return when {
+            p.contains(".m3u8") -> "HLS playlist"
+            p.contains(".mpd") -> "MPEG-DASH manifest"
+            p.contains(".webm") -> "WebM"
+            p.contains(".mkv") -> "Matroska"
+            p.contains(".mov") -> "QuickTime"
+            p.contains(".ts") -> "MPEG-TS segment"
+            else -> "Video"
+        }
+    }
+
+    private fun shortVideoLabel(raw: String): String {
+        val u = Uri.parse(raw)
+        val host = u.host ?: "Video"
+        val file = u.lastPathSegment?.substringBefore('?')?.takeIf { it.isNotBlank() }
+        return (file ?: host).let { if (it.length > 34) it.take(31) + "…" else it }
+    }
+
+    private fun addVideoCandidate(url: String, title: String, mime: String, kind: String) {
+        if (!url.startsWith("http://") && !url.startsWith("https://")) return
+        if (url.length > 12000 || url.contains("googlevideo.com/videoplayback") && url.contains("expire=") ) {
+            // Signed URLs are retained exactly as received; only their visible label is shortened.
+        }
+        runOnUiThread {
+            if (!videoCandidates.containsKey(url)) {
+                videoCandidates[url] = VideoCandidate(url, shortVideoLabel(url), mime, kind)
+                videoLinksButton.text = "Video Links •"
+                startVideoBlink()
+            }
+        }
+    }
+
+    private fun startVideoBlink() {
+        if (videoBlinking) return
+        videoBlinking = true
+        val task = object : Runnable {
+            var lit = false
+            override fun run() {
+                if (!videoBlinking || videoCandidates.isEmpty()) {
+                    videoLinksButton.alpha = 1f
+                    videoBlinking = false
+                    return
+                }
+                lit = !lit
+                videoLinksButton.alpha = if (lit) 1f else 0.35f
+                videoBlinkHandler.postDelayed(this, 550)
+            }
+        }
+        videoBlinkHandler.post(task)
+    }
+
+    private fun scanPageForVideos(view: WebView) {
+        view.evaluateJavascript("""
+          (function(){
+            const out = new Map();
+            const add = (u,t,m) => { try { if(u && /^https?:/i.test(u)) out.set(u,{url:u,title:t||'',mime:m||''}); } catch(e){} };
+            document.querySelectorAll('video,audio').forEach(v=>{
+              add(v.currentSrc || v.src, v.getAttribute('title') || document.title, v.getAttribute('type') || '');
+              v.querySelectorAll('source').forEach(s=>add(s.src, document.title, s.type));
+            });
+            document.querySelectorAll('source[src]').forEach(s=>add(s.src,document.title,s.type));
+            try { performance.getEntriesByType('resource').forEach(e=>{
+              const u=e.name||'';
+              if(/\\.(mp4|m4v|webm|mov|mkv|3gp|m3u8|mpd|ts)(\\?|$)/i.test(u)) add(u,document.title,'');
+            }); } catch(e){}
+            out.forEach(x=>window.SlBrowserVideoBridge.found(x.url,x.title,x.mime));
+            return out.size;
+          })();
+        """.trimIndent(), null)
+    }
+
+    inner class VideoScanBridge {
+        @JavascriptInterface fun found(url: String, title: String, mime: String) {
+            addVideoCandidate(url, title, mime, videoKind(url))
+        }
+    }
+
+    private fun showVideoLinks() {
+        videoBlinking = false
+        videoBlinkHandler.removeCallbacksAndMessages(null)
+        videoLinksButton.alpha = 1f
+        videoLinksButton.text = "Video Links"
+        val items = videoCandidates.values.toList()
+        val labels = items.map { "${it.title}  •  ${it.kind}" }.toMutableList()
+        labels.add(0, "Extract links from this page (yt-dlp)")
+        AlertDialog.Builder(this).setTitle("Video Links (${items.size})")
+            .setItems(labels.toTypedArray()) { _, which ->
+                if (which == 0) {
+                    analyzeCurrentPageWithExtractor()
+                } else {
+                    val item = items[which - 1]
+                    AlertDialog.Builder(this).setTitle("Ready to download?")
+                        .setMessage("${item.title}\n${item.kind}\n\nThe original URL is preserved.")
+                        .setPositiveButton("Download") { _, _ ->
+                            startDownload(PendingDownload(item.url, WebSettings.getDefaultUserAgent(this), null, item.mime))
+                        }
+                        .setNeutralButton("Copy link") { _, _ ->
+                            val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                            cm.setPrimaryClip(ClipData.newPlainText("Video URL", item.url))
+                            toast("Original video link copied")
+                        }
+                        .setNegativeButton("Cancel", null).show()
+                }
+            }
+            .setNegativeButton("Close", null).show()
+    }
+
+    private fun analyzeCurrentPageWithExtractor() {
+        val pageUrl = web.url?.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+        if (pageUrl == null) {
+            toast("Open a video webpage first")
+            return
+        }
+        status.text = "Analyzing video page..."
+        Thread {
+            try {
+                val info = YoutubeDL.getInstance().getInfo(pageUrl)
+                val title = info.title?.takeIf { it.isNotBlank() } ?: "Online video"
+                val request = YoutubeDLRequest(pageUrl)
+                request.addOption("-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best")
+                request.addOption("--merge-output-format", "mp4")
+                request.addOption("--no-mtime")
+                runOnUiThread {
+                    status.text = "Video source found: $title"
+                    AlertDialog.Builder(this)
+                        .setTitle("Video source found")
+                        .setMessage("$title\n\nSource page analyzed successfully. The extractor will choose the best available compatible video/audio streams and merge them when required.")
+                        .setPositiveButton("Download video") { _, _ -> startExtractorDownload(request, title) }
+                        .setNeutralButton("Copy page link") { _, _ ->
+                            val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+                            cm.setPrimaryClip(ClipData.newPlainText("Video page", pageUrl))
+                            toast("Page link copied")
+                        }
+                        .setNegativeButton("Cancel", null).show()
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    status.text = "Video extraction failed"
+                    AlertDialog.Builder(this).setTitle("Could not extract video")
+                        .setMessage(e.message ?: "This site may not be supported, or the video may require login, DRM, or an unavailable extractor.")
+                        .setPositiveButton("OK", null).show()
+                }
+            }
+        }.start()
+    }
+
+    private fun startExtractorDownload(request: YoutubeDLRequest, title: String) {
+        val downloads = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "SlBrowser")
+        if (!downloads.exists()) downloads.mkdirs()
+        request.addOption("-o", File(downloads, "%(title).120B.%(ext)s").absolutePath)
+        val processId = "slbrowser-video-${System.currentTimeMillis()}"
+        status.text = "Starting video download..."
+        Thread {
+            try {
+                YoutubeDL.getInstance().execute(request, processId) { progress, eta, line ->
+                    runOnUiThread {
+                        status.text = "Video: ${progress.toInt()}% • ${line.take(90)}"
+                    }
+                    kotlin.Unit
+                }
+                runOnUiThread {
+                    status.text = "Video download completed: $title"
+                    toast("Video download completed")
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    status.text = "Video download failed"
+                    toast("Video download failed: ${e.message ?: "unknown error"}")
+                }
+            }
+        }.start()
+    }
+
+    private fun installGeneratedDownloadCapture(view: WebView) {
+        view.evaluateJavascript("""
+            (function(){
+              if (window.__slGeneratedDownloadCapture) return;
+              window.__slGeneratedDownloadCapture = true;
+              document.addEventListener('click', function(event) {
+                const a = event.target && event.target.closest ? event.target.closest('a[href]') : null;
+                if (!a) return;
+                const href = a.href || '';
+                if (!href.startsWith('blob:') && !href.startsWith('data:')) return;
+                event.preventDefault();
+                event.stopImmediatePropagation();
+                const name = a.getAttribute('download') || 'download';
+                (async function(){
+                  try {
+                    const response = await fetch(href);
+                    const blob = await response.blob();
+                    window.SlBrowserDownloadBridge.beginGeneratedDownload(name, blob.type || 'application/octet-stream');
+                    const reader = blob.stream().getReader();
+                    while (true) {
+                      const part = await reader.read();
+                      if (part.done) break;
+                      const bytes = part.value;
+                      let binary = '';
+                      for (let i=0; i<bytes.length; i+=0x8000) {
+                        binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i+0x8000, bytes.length)));
+                      }
+                      window.SlBrowserDownloadBridge.appendGeneratedDownload(btoa(binary));
+                    }
+                    window.SlBrowserDownloadBridge.finishGeneratedDownload();
+                  } catch (e) {
+                    window.SlBrowserDownloadBridge.failGeneratedDownload(String(e));
+                  }
+                })();
+              }, true);
+            })();
+        """.trimIndent(), null)
     }
 
     private fun createTab(url: String, switchTo: Boolean): WebView {
@@ -536,19 +811,29 @@ class MainActivity : Activity() {
     }
 
     private fun startDownload(item: PendingDownload) {
-        if (Build.VERSION.SDK_INT in 23..28 && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+        val uri = Uri.parse(item.url)
+        if (uri.scheme != "http" && uri.scheme != "https") {
+            when (uri.scheme?.lowercase(Locale.ROOT)) {
+                "blob", "data" -> downloadPageGeneratedUrl(web, item.url, item.disposition, item.mimeType)
+                "content", "file" -> copyLocalUriToDownloads(uri, item.disposition, item.mimeType)
+                else -> toast("Unsupported download link type")
+            }
+            return
+        }
+        if (Build.VERSION.SDK_INT in 23..28 &&
+            checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
             pendingDownload = item
             requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 808)
             return
         }
         try {
-            val name = guessName(item.disposition, item.url)
+            val name = safeDownloadName(guessName(item.disposition, item.url))
             val ext = MimeTypeMap.getFileExtensionFromUrl(item.url)
             val mime = item.mimeType?.takeIf { it.isNotBlank() }
                 ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
-            val request = DownloadManager.Request(Uri.parse(item.url))
+            val request = DownloadManager.Request(uri)
                 .setTitle(name)
-                .setDescription("Downloading with SlBrowser")
+                .setDescription("SlBrowser download")
                 .setMimeType(mime)
                 .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
                 .setAllowedOverRoaming(true)
@@ -557,12 +842,171 @@ class MainActivity : Activity() {
             item.userAgent?.takeIf { it.isNotBlank() }?.let { request.addRequestHeader("User-Agent", it) }
             CookieManager.getInstance().getCookie(item.url)?.let { request.addRequestHeader("Cookie", it) }
             web.url?.let { request.addRequestHeader("Referer", it) }
-            (getSystemService(DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
-            status.text = "Download started: $name"
+            val id = (getSystemService(DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
+            prefs.edit().putLong("last_download_id", id).apply()
+            status.text = "Download queued: $name"
             toast("Download started")
         } catch (e: Exception) {
             status.text = "Download failed to start"
-            toast("Unable to start download: ${e.message ?: "unknown error"}")
+            toast("Download error: ${e.message ?: "unknown error"}")
+        }
+    }
+
+    private fun downloadPageGeneratedUrl(view: WebView, url: String, disposition: String?, mime: String?) {
+        val name = safeDownloadName(guessName(disposition, url))
+        val quotedUrl = JSONObject.quote(url)
+        val quotedName = JSONObject.quote(name)
+        val quotedMime = JSONObject.quote(mime ?: "application/octet-stream")
+        view.evaluateJavascript("""
+            (async function(){
+              try {
+                const response = await fetch($quotedUrl, {credentials:'include'});
+                if (!response.ok && response.status !== 0) throw new Error('HTTP ' + response.status);
+                const blob = await response.blob();
+                const name = $quotedName;
+                const type = blob.type || $quotedMime || 'application/octet-stream';
+                window.SlBrowserDownloadBridge.beginGeneratedDownload(name, type);
+                const reader = blob.stream().getReader();
+                while (true) {
+                  const part = await reader.read();
+                  if (part.done) break;
+                  const bytes = part.value;
+                  let binary = '';
+                  for (let i=0; i<bytes.length; i+=0x8000) {
+                    binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(i+0x8000, bytes.length)));
+                  }
+                  window.SlBrowserDownloadBridge.appendGeneratedDownload(btoa(binary));
+                }
+                window.SlBrowserDownloadBridge.finishGeneratedDownload();
+                return 'OK';
+              } catch(e) {
+                window.SlBrowserDownloadBridge.failGeneratedDownload(String(e));
+                return 'ERROR:' + String(e);
+              }
+            })()
+        """.trimIndent()) { result ->
+            val value = result?.trim('"') ?: ""
+            if (value.startsWith("ERROR:")) {
+                status.text = "Generated download failed"
+                toast("Cannot download this generated file: ${value.removePrefix("ERROR:")}")
+            } else if (value == "OK") {
+                status.text = "Generated file saved"
+            }
+        }
+    }
+
+    inner class DownloadBridge {
+        @JavascriptInterface fun beginGeneratedDownload(name: String, mime: String) {
+            synchronized(this@MainActivity) {
+                try {
+                    blobOutput?.close()
+                    blobDisplayName = safeDownloadName(name)
+                    blobMimeType = mime.ifBlank { "application/octet-stream" }
+                    blobBytes = 0L
+                    blobTempFile = File(cacheDir, "slbrowser_${System.currentTimeMillis()}.part")
+                    blobOutput = FileOutputStream(blobTempFile!!)
+                } catch (e: Exception) {
+                    blobOutput = null
+                    runOnUiThread { toast("Cannot prepare download file") }
+                }
+            }
+        }
+        @JavascriptInterface fun appendGeneratedDownload(base64: String) {
+            synchronized(this@MainActivity) {
+                try {
+                    val bytes = Base64.decode(base64, Base64.DEFAULT)
+                    blobOutput?.write(bytes)
+                    blobBytes += bytes.size
+                } catch (e: Exception) {
+                    runOnUiThread { toast("Download data transfer failed") }
+                }
+            }
+        }
+        @JavascriptInterface fun finishGeneratedDownload() {
+            synchronized(this@MainActivity) {
+                try {
+                    blobOutput?.flush()
+                    blobOutput?.close()
+                    blobOutput = null
+                    val temp = blobTempFile ?: throw IllegalStateException("Missing temporary file")
+                    publishGeneratedFile(temp, blobDisplayName, blobMimeType)
+                    blobTempFile = null
+                    runOnUiThread {
+                        status.text = "Saved $blobDisplayName (${blobBytes} bytes)"
+                        toast("Download saved")
+                    }
+                } catch (e: Exception) {
+                    runOnUiThread { toast("Unable to save generated file: ${e.message}") }
+                }
+            }
+        }
+        @JavascriptInterface fun failGeneratedDownload(reason: String) {
+            synchronized(this@MainActivity) {
+                try { blobOutput?.close() } catch (_: Exception) {}
+                blobOutput = null
+                blobTempFile?.delete()
+                blobTempFile = null
+                runOnUiThread { status.text = "Download failed: $reason" }
+            }
+        }
+    }
+
+    private fun publishGeneratedFile(temp: File, name: String, mime: String) {
+        if (Build.VERSION.SDK_INT >= 29) {
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, name)
+                put(MediaStore.Downloads.MIME_TYPE, mime)
+                put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                put(MediaStore.Downloads.IS_PENDING, 1)
+            }
+            val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: throw IllegalStateException("Cannot create Downloads entry")
+            try {
+                contentResolver.openOutputStream(uri)?.use { out -> temp.inputStream().use { it.copyTo(out) } }
+                    ?: throw IllegalStateException("Cannot open destination")
+                values.clear()
+                values.put(MediaStore.Downloads.IS_PENDING, 0)
+                contentResolver.update(uri, values, null, null)
+            } catch (e: Exception) {
+                contentResolver.delete(uri, null, null)
+                throw e
+            } finally { temp.delete() }
+        } else {
+            val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            if (!dir.exists()) dir.mkdirs()
+            val target = uniqueFile(File(dir, name))
+            temp.copyTo(target, overwrite = false)
+            temp.delete()
+        }
+    }
+
+    private fun copyLocalUriToDownloads(uri: Uri, disposition: String?, mime: String?) {
+        try {
+            val name = safeDownloadName(guessName(disposition, uri.toString()))
+            val type = mime ?: contentResolver.getType(uri) ?: "application/octet-stream"
+            val temp = File(cacheDir, "slbrowser_local_${System.currentTimeMillis()}.part")
+            contentResolver.openInputStream(uri)?.use { input -> temp.outputStream().use { input.copyTo(it) } }
+                ?: throw IllegalStateException("Cannot open source file")
+            publishGeneratedFile(temp, name, type)
+            toast("Download saved")
+        } catch (e: Exception) { toast("Unable to copy file: ${e.message}") }
+    }
+
+    private fun safeDownloadName(value: String): String {
+        val cleaned = value.substringAfterLast('/').substringAfterLast('\\')
+            .replace(Regex("[\\\\/:*?\"<>|\\u0000-\\u001F]"), "_").trim()
+        return cleaned.take(120).ifBlank { "download_${System.currentTimeMillis()}" }
+    }
+
+    private fun uniqueFile(file: File): File {
+        if (!file.exists()) return file
+        val base = file.nameWithoutExtension
+        val ext = file.extension
+        var n = 1
+        while (true) {
+            val candidate = File(file.parentFile, "${base}_$n${if (ext.isBlank()) "" else ".$ext"}")
+            if (!candidate.exists()) return candidate
+            n++
         }
     }
 

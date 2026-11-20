@@ -1,14 +1,25 @@
-# SlBrowser — Version 1.4
+# SlBrowser 1.7
 
-Updates in this revision:
-- Replaced the horizontally scrolling second row with a fixed-width row of equally sized controls that fit the screen: Back, Forward, Past, Full Screen, History, Bookmarks, Downloads, and Mode.
-- Kept the horizontal page-progress indicator in a fixed 4dp slot so showing/hiding progress does not shift the home layout.
-- Reordered the bottom controls so File is immediately left of Answer, and Answer is at the far right.
-- Updated button labels to larger, top-left aligned text rather than centered text.
-- Added pinch-to-zoom for the web page, clamped between 60% and 100%.
-- Added Past (paste clipboard text into the currently focused web text field) and Full Screen controls.
-- Added persistent settings to browse without images and to disable/enable JavaScript. Disabling JavaScript can prevent some sites from working correctly.
-- Shortened History and Bookmark list labels to compact host/path text to avoid oversized URL strings; the original URL remains the navigation target.
-- Preserved the selected launcher icon asset.
+## Video Links: yt-dlp extraction engine
+The Video Links panel now offers an explicit “Extract links from this page (yt-dlp)” action. It analyzes the current HTTP/HTTPS page URL using yt-dlp-android, then offers a best-compatible video download. It requests separate best video + audio streams and MP4 merge where supported, using the bundled FFmpeg component.
 
-Build with the included GitHub Actions workflow. APK compilation was not run in this environment because Gradle is not installed.
+Existing WebView-detected direct media candidates remain available in the same panel.
+
+## Dependency and compatibility
+- `io.github.junkfood02.youtubedl-android:library:0.18.1`
+- `io.github.junkfood02.youtubedl-android:ffmpeg:0.18.1`
+- ABI: `armeabi-v7a`
+- Minimum Android API: 24 (Android 7.0), increased from 23 because the extractor library requires API 24.
+- Native libraries are packaged uncompressed/extracted as required by the dependency.
+
+## Important legal and technical notes
+The youtubedl-android project is GPL-3.0 licensed. Distributing SlBrowser with this dependency requires complying with GPL-3.0 obligations, including providing corresponding source and license notices for the distributed combined work. Review the license before public distribution.
+
+yt-dlp supports many sites but cannot guarantee extraction from every site. DRM-protected streams, private/login-gated content, unsupported or changed site extractors, geo restrictions, and some live streams may fail. Download only content you are authorized to save.
+
+## Build
+Gradle dependencies are resolved from Maven Central. The project ZIP has not been compiled in this environment; validate through GitHub Actions before installing.
+
+
+## Version 1.8 UI adjustment
+- Reduced vertical padding at the bottom of the address/header row and removed extra vertical padding from the navigation row so the two top rows sit as close together as possible without changing button sizes.

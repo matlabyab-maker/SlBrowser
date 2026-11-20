@@ -5,6 +5,8 @@
     <application
         android:icon="@drawable/slbrowser_icon"
         android:allowBackup="true"
+        android:extractNativeLibs="true"
+        android:requestLegacyExternalStorage="true"
         android:label="SlBrowser"
         android:usesCleartextTraffic="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
