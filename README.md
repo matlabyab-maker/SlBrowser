@@ -12,3 +12,8 @@ Android WebView browser project.
 
 ## Build
 The GitHub Actions workflow builds a debug APK on pushes to any branch and supports manual runs.
+
+## Version 1.2 bug fixes
+- Auto Select OFF now removes the page selection-mode class as well as its visual style, preventing ordinary page taps from opening the save-text dialog.
+- File opens Android's document picker even when the current website has no upload field; when a website file input exists, the selected URI is passed back to the website's upload control.
+- File chooser falls back to ACTION_GET_CONTENT if ACTION_OPEN_DOCUMENT is unavailable.
