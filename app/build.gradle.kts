@@ -11,8 +11,8 @@ android {
         applicationId = "com.slbrowser.app"
         minSdk = 24
         targetSdk = 35
-        versionCode = 7
-        versionName = "1.8"
+        versionCode = 8
+        versionName = "1.9"
         ndk { abiFilters += listOf("armeabi-v7a") }
     }
 

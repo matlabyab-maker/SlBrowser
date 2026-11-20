@@ -23,3 +23,8 @@ Gradle dependencies are resolved from Maven Central. The project ZIP has not bee
 
 ## Version 1.8 UI adjustment
 - Reduced vertical padding at the bottom of the address/header row and removed extra vertical padding from the navigation row so the two top rows sit as close together as possible without changing button sizes.
+
+
+## Version 1.9 build fixes
+- Removed the unresolved `FFmpeg` Kotlin import and explicit initialization call. The FFmpeg Gradle dependency remains included for the extractor package.
+- Replaced the invalid `WebView.isDestroyed` check with Activity lifecycle checks and a check that the WebView is still registered as a tab.

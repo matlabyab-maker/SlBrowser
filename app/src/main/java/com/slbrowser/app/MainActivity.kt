@@ -46,7 +46,6 @@ import android.widget.TextView
 import android.widget.Toast
 import com.yausername.youtubedl_android.YoutubeDL
 import com.yausername.youtubedl_android.YoutubeDLRequest
-import com.yausername.youtubedl_android.FFmpeg
 import com.yausername.youtubedl_android.YoutubeDLException
 import org.json.JSONArray
 import org.json.JSONObject
@@ -94,7 +93,6 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         try {
             YoutubeDL.getInstance().init(this)
-            FFmpeg.getInstance().init(this)
         } catch (e: Exception) {
             android.util.Log.e("SlBrowser", "Video extractor initialization failed", e)
         }
@@ -259,7 +257,7 @@ class MainActivity : Activity() {
                     scanPageForVideos(view)
                     view.postDelayed(object : Runnable {
                         override fun run() {
-                            if (!view.isDestroyed && view.url == url) {
+                            if (!this@MainActivity.isFinishing && !this@MainActivity.isDestroyed && tabViews.contains(view) && view.url == url) {
                                 scanPageForVideos(view)
                                 view.postDelayed(this, 2500)
                             }
