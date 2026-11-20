@@ -73,7 +73,7 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(WRAP, MATCH))
 
         address = EditText(this).apply {
-            singleLine = true
+            setSingleLine(true)
             textSize = 15f
             hint = "Enter address or search"
             setTextColor(Color.BLACK)
