@@ -3,6 +3,10 @@ package com.slbrowser.app
 import android.app.Activity
 import android.app.AlertDialog
 import android.app.DownloadManager
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
+import android.webkit.MimeTypeMap
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
@@ -22,6 +26,7 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.ProgressBar
 import android.widget.EditText
 import android.widget.HorizontalScrollView
 import android.widget.LinearLayout
@@ -40,6 +45,11 @@ class MainActivity : Activity() {
     private var currentTab = 0
     private val web: WebView get() = tabViews[currentTab]
     private lateinit var webContainer: FrameLayout
+    private lateinit var pageProgress: ProgressBar
+    private lateinit var modeButton: Button
+    private var desktopMode = false
+    private data class PendingDownload(val url: String, val userAgent: String?, val disposition: String?, val mimeType: String?)
+    private var pendingDownload: PendingDownload? = null
     private var fileChooserCallback: android.webkit.ValueCallback<Array<Uri>>? = null
     private lateinit var address: EditText
     private lateinit var status: TextView
@@ -53,6 +63,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         history.addAll(readList("history"))
+        desktopMode = prefs.getBoolean("desktop_mode", false)
         bookmarks.addAll(readList("bookmarks"))
         buildInterface()
         val last = prefs.getString("last_url", null)
@@ -98,9 +109,19 @@ class MainActivity : Activity() {
         navRow.addView(makeButton("History", 88) { showHistory() })
         navRow.addView(makeButton("Bookmarks", 112) { showBookmarks() })
         navRow.addView(makeButton("Downloads", 112) { showDownloadsInfo() })
+        modeButton = makeButton(if (desktopMode) "Mode: Desktop" else "Mode: Mobile", 122) { showModeChooser() }
+        navRow.addView(modeButton)
         nav.addView(navRow)
         root.addView(nav)
 
+        pageProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progress = 0
+            visibility = View.GONE
+            isIndeterminate = false
+            progressTintList = android.content.res.ColorStateList.valueOf(Color.rgb(25, 118, 210))
+        }
+        root.addView(pageProgress, LinearLayout.LayoutParams(MATCH, dp(4)))
         webContainer = FrameLayout(this)
         root.addView(webContainer, LinearLayout.LayoutParams(MATCH, 0, 1f))
         createTab("https://www.google.com", switchTo = true)
@@ -140,12 +161,32 @@ class MainActivity : Activity() {
             displayZoomControls = false
             setSupportZoom(true)
             textZoom = 100
-            userAgentString = WebSettings.getDefaultUserAgent(this@MainActivity)
+            userAgentString = if (desktopMode) desktopUserAgent() else WebSettings.getDefaultUserAgent(this@MainActivity)
         }
         CookieManager.getInstance().setAcceptCookie(true)
         CookieManager.getInstance().setAcceptThirdPartyCookies(view, true)
         view.addJavascriptInterface(PageBridge(), "SlBrowserBridge")
         view.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(v: WebView?, request: android.webkit.WebResourceRequest?): Boolean {
+                if (request?.isForMainFrame != true) return false
+                val target = request.url.toString()
+                val path = Uri.parse(target).lastPathSegment?.lowercase(Locale.ROOT).orEmpty()
+                val downloadable = listOf(".pdf", ".zip", ".rar", ".7z", ".apk", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".csv", ".txt", ".mp3", ".mp4", ".m4a", ".wav")
+                if (downloadable.any { path.endsWith(it) }) {
+                    startDownload(PendingDownload(target, WebSettings.getDefaultUserAgent(this@MainActivity), null, null))
+                    return true
+                }
+                return false
+            }
+
+            override fun onPageStarted(v: WebView?, url: String?, favicon: android.graphics.Bitmap?) {
+                super.onPageStarted(v, url, favicon)
+                if (tabViews.indexOf(view) == currentTab) {
+                    pageProgress.progress = 0
+                    pageProgress.visibility = View.VISIBLE
+                    status.text = "Loading page…"
+                }
+            }
             override fun onPageFinished(v: WebView?, url: String?) {
                 super.onPageFinished(v, url)
                 val index = tabViews.indexOf(view)
@@ -155,6 +196,8 @@ class MainActivity : Activity() {
                         address.setText(url)
                         prefs.edit().putString("last_url", url).apply()
                         status.text = view.title ?: url
+                        pageProgress.progress = 100
+                        pageProgress.visibility = View.GONE
                         if (autoSelect) injectAutoSelect()
                     }
                     addHistory(url)
@@ -162,6 +205,13 @@ class MainActivity : Activity() {
             }
         }
         view.webChromeClient = object : WebChromeClient() {
+            override fun onProgressChanged(v: WebView?, newProgress: Int) {
+                if (tabViews.indexOf(view) == currentTab) {
+                    pageProgress.progress = newProgress.coerceIn(0, 100)
+                    pageProgress.visibility = if (newProgress < 100) View.VISIBLE else View.GONE
+                    if (newProgress < 100) status.text = "Loading page… $newProgress%"
+                }
+            }
             override fun onShowFileChooser(
                 webView: WebView?,
                 callback: android.webkit.ValueCallback<Array<Uri>>?,
@@ -170,12 +220,11 @@ class MainActivity : Activity() {
                 fileChooserCallback?.onReceiveValue(null)
                 fileChooserCallback = callback
                 return try {
-                    val intent = params?.createIntent() ?: Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                    val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                         addCategory(Intent.CATEGORY_OPENABLE)
                         type = "*/*"
-                    }
-                    if (params?.mode == FileChooserParams.MODE_OPEN_MULTIPLE) {
-                        intent.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
                     }
                     startActivityForResult(intent, fileRequest)
                     true
@@ -201,15 +250,7 @@ class MainActivity : Activity() {
             }
         }
         view.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
-            try {
-                val request = DownloadManager.Request(Uri.parse(url))
-                    .setMimeType(mimeType)
-                    .addRequestHeader("User-Agent", userAgent)
-                    .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                    .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, guessName(contentDisposition, url))
-                (getSystemService(DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
-                toast("Download started")
-            } catch (_: Exception) { toast("Unable to start download") }
+            startDownload(PendingDownload(url, userAgent, contentDisposition, mimeType))
         })
     }
 
@@ -299,14 +340,29 @@ class MainActivity : Activity() {
         }.show()
     }
 
+    private fun desktopUserAgent(): String =
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+    private fun showModeChooser() {
+        val modes = arrayOf("Mobile mode", "Desktop mode")
+        AlertDialog.Builder(this).setTitle("Choose website mode")
+            .setSingleChoiceItems(modes, if (desktopMode) 1 else 0) { dialog, which ->
+                dialog.dismiss()
+                setDesktopMode(which == 1)
+            }.setNegativeButton("Cancel", null).show()
+    }
+
     private fun setDesktopMode(enabled: Boolean) {
-        val ua = if (enabled) {
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        } else WebSettings.getDefaultUserAgent(this)
-        web.settings.userAgentString = ua
-        web.settings.useWideViewPort = enabled
-        web.settings.loadWithOverviewMode = enabled
+        desktopMode = enabled
+        prefs.edit().putBoolean("desktop_mode", enabled).apply()
+        tabViews.forEach { tab ->
+            tab.settings.userAgentString = if (enabled) desktopUserAgent() else WebSettings.getDefaultUserAgent(this)
+            tab.settings.useWideViewPort = true
+            tab.settings.loadWithOverviewMode = enabled
+        }
+        if (::modeButton.isInitialized) modeButton.text = if (enabled) "Mode: Desktop" else "Mode: Mobile"
         web.reload()
+        status.text = if (enabled) "Desktop mode enabled" else "Mobile mode enabled"
     }
 
     private fun showSettings() {
@@ -392,14 +448,61 @@ class MainActivity : Activity() {
                 rows.add(id to "$title — $state")
             }
         }
-        if (rows.isEmpty()) { toast("No downloads yet"); return }
-        AlertDialog.Builder(this).setTitle("Downloads")
-            .setItems(rows.map { it.second }.toTypedArray()) { _, which ->
-                val id = rows[which].first
+        val labels = rows.map { it.second }.toMutableList()
+        labels.add("Open device Downloads folder")
+        AlertDialog.Builder(this).setTitle("Downloads").setItems(labels.toTypedArray()) { _, which ->
+            if (which == rows.size) {
+                try { startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) }
+                catch (_: Exception) { toast("Open the Downloads folder in your file manager") }
+            } else {
                 try {
-                    startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS))
-                } catch (_: Exception) { toast("Open Downloads from device file manager") }
-            }.setNegativeButton("Close", null).show()
+                    val uri = manager.getUriForDownloadedFile(rows[which].first)
+                    if (uri != null) startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, contentResolver.getType(uri) ?: "*/*").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                    else toast("This download is not ready yet")
+                } catch (_: Exception) { toast("Unable to open downloaded file") }
+            }
+        }.setNegativeButton("Close", null).show()
+    }
+
+    private fun startDownload(item: PendingDownload) {
+        if (Build.VERSION.SDK_INT in 23..28 && checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            pendingDownload = item
+            requestPermissions(arrayOf(Manifest.permission.WRITE_EXTERNAL_STORAGE), 808)
+            return
+        }
+        try {
+            val name = guessName(item.disposition, item.url)
+            val ext = MimeTypeMap.getFileExtensionFromUrl(item.url)
+            val mime = item.mimeType?.takeIf { it.isNotBlank() }
+                ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
+            val request = DownloadManager.Request(Uri.parse(item.url))
+                .setTitle(name)
+                .setDescription("Downloading with SlBrowser")
+                .setMimeType(mime)
+                .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                .setAllowedOverRoaming(true)
+                .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
+            if (Build.VERSION.SDK_INT >= 24) request.setAllowedOverMetered(true)
+            item.userAgent?.takeIf { it.isNotBlank() }?.let { request.addRequestHeader("User-Agent", it) }
+            CookieManager.getInstance().getCookie(item.url)?.let { request.addRequestHeader("Cookie", it) }
+            web.url?.let { request.addRequestHeader("Referer", it) }
+            (getSystemService(DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
+            status.text = "Download started: $name"
+            toast("Download started")
+        } catch (e: Exception) {
+            status.text = "Download failed to start"
+            toast("Unable to start download: ${e.message ?: "unknown error"}")
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 808) {
+            val item = pendingDownload
+            pendingDownload = null
+            if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED && item != null) startDownload(item)
+            else toast("Storage permission is required for downloads on this Android version")
+        }
     }
 
     private fun chooseFiles() {
@@ -408,7 +511,9 @@ class MainActivity : Activity() {
               const inputs=[...document.querySelectorAll('input[type=file]:not(:disabled)')];
               if(!inputs.length) return 'NO_FILE_INPUT';
               const shown=inputs.filter(el=>{const r=el.getBoundingClientRect();return r.width>0&&r.height>0;});
-              (shown[shown.length-1]||inputs[inputs.length-1]).click();
+              const target=shown[shown.length-1]||inputs[inputs.length-1];
+              target.multiple=true;
+              target.click();
               return 'OPENED';
             })()
         """.trimIndent()) { result ->
