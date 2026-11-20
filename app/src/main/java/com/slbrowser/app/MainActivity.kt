@@ -16,6 +16,9 @@ import android.os.Environment
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.ScaleGestureDetector
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.view.inputmethod.InputMethodManager
 import android.webkit.CookieManager
 import android.webkit.DownloadListener
@@ -58,6 +61,11 @@ class MainActivity : Activity() {
     private val history = mutableListOf<String>()
     private val bookmarks = mutableListOf<String>()
     private var autoSelect = false
+    private var fullScreen = false
+    private var pageScale = 1.0f
+    private lateinit var headerBar: LinearLayout
+    private lateinit var navBar: LinearLayout
+    private lateinit var bottomBar: LinearLayout
     private val fileRequest = 701
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -100,19 +108,31 @@ class MainActivity : Activity() {
         header.addView(makeButton("Go", 50) { navigate(address.text.toString()) })
         header.addView(makeButton("Tabs", 62) { showTabs() })
         header.addView(makeButton("Menu", 58) { showMainMenu() })
+        headerBar = header
         root.addView(header)
 
-        val nav = HorizontalScrollView(this).apply { isHorizontalScrollBarEnabled = false }
-        val navRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        navRow.addView(makeButton("Back", 82) { if (web.canGoBack()) web.goBack() else toast("No previous page") })
-        navRow.addView(makeButton("Forward", 94) { if (web.canGoForward()) web.goForward() else toast("No next page") })
-        navRow.addView(makeButton("History", 88) { showHistory() })
-        navRow.addView(makeButton("Bookmarks", 112) { showBookmarks() })
-        navRow.addView(makeButton("Downloads", 112) { showDownloadsInfo() })
-        modeButton = makeButton(if (desktopMode) "Mode: Desktop" else "Mode: Mobile", 122) { showModeChooser() }
-        navRow.addView(modeButton)
-        nav.addView(navRow)
-        root.addView(nav)
+        navBar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+        }
+        val navItems = listOf(
+            "Back" to { if (web.canGoBack()) web.goBack() else toast("No previous page") },
+            "Forward" to { if (web.canGoForward()) web.goForward() else toast("No next page") },
+            "Past" to { pasteFromClipboard() },
+            "Full Screen" to { toggleFullScreen() },
+            "History" to { showHistory() },
+            "Bookmarks" to { showBookmarks() },
+            "Downloads" to { showDownloadsInfo() },
+            "Mode" to { showModeChooser() }
+        )
+        navItems.forEach { (label, action) ->
+            val b = makeButton(label, 1, 48, action)
+            b.textSize = 10.5f
+            navBar.addView(b, LinearLayout.LayoutParams(0, dp(48), 1f))
+        }
+        modeButton = navBar.getChildAt(7) as Button
+        modeButton.text = if (desktopMode) "Desktop" else "Mobile"
+        root.addView(navBar)
 
         pageProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
@@ -139,20 +159,21 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER
             setPadding(5, 5, 5, 7)
         }
-        bottom.addView(makeButton("File", 1, 64) { chooseFiles() }, LinearLayout.LayoutParams(0, dp(64), 1f).apply { setMargins(2, 0, 2, 0) })
+        bottom.addView(makeButton("Auto Select", 1, 64) { toggleAutoSelect() }, LinearLayout.LayoutParams(0, dp(64), 1.05f).apply { setMargins(2, 0, 2, 0) })
+        bottom.addView(makeButton("Save", 1, 64) { savePageText() }, LinearLayout.LayoutParams(0, dp(64), 0.9f).apply { setMargins(2, 0, 2, 0) })
+        bottom.addView(makeButton("File", 1, 64) { chooseFiles() }, LinearLayout.LayoutParams(0, dp(64), 0.9f).apply { setMargins(2, 0, 2, 0) })
         bottom.addView(makeButton("Answer", 1, 64) { answerDialog() }, LinearLayout.LayoutParams(0, dp(64), 1.15f).apply { setMargins(2, 0, 2, 0) })
-        bottom.addView(makeButton("Save", 1, 64) { savePageText() }, LinearLayout.LayoutParams(0, dp(64), 1f).apply { setMargins(2, 0, 2, 0) })
-        bottom.addView(makeButton("Auto Select", 1, 64) { toggleAutoSelect() }, LinearLayout.LayoutParams(0, dp(64), 1.2f).apply { setMargins(2, 0, 2, 0) })
+        bottomBar = bottom
         root.addView(bottom)
         setContentView(root)
     }
 
     private fun configureWebView(view: WebView) {
         view.settings.apply {
-            javaScriptEnabled = true
+            javaScriptEnabled = prefs.getBoolean("javascript_enabled", true)
             domStorageEnabled = true
             databaseEnabled = true
-            loadsImagesAutomatically = true
+            loadsImagesAutomatically = prefs.getBoolean("images_enabled", true)
             javaScriptCanOpenWindowsAutomatically = true
             setSupportMultipleWindows(true)
             useWideViewPort = true
@@ -249,6 +270,14 @@ class MainActivity : Activity() {
                 if (index >= 0 && !title.isNullOrBlank()) tabTitles[index] = title
             }
         }
+        val pinch = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                pageScale = (pageScale * detector.scaleFactor).coerceIn(0.6f, 1.0f)
+                view.evaluateJavascript("document.documentElement.style.zoom='${pageScale}'", null)
+                return true
+            }
+        })
+        view.setOnTouchListener { _, event -> pinch.onTouchEvent(event); false }
         view.setDownloadListener(DownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
             startDownload(PendingDownload(url, userAgent, contentDisposition, mimeType))
         })
@@ -305,7 +334,9 @@ class MainActivity : Activity() {
             minHeight = dp(heightDp)
             minimumHeight = dp(heightDp)
             minWidth = dp(minWidthDp)
-            setPadding(8, 2, 8, 2)
+            gravity = Gravity.TOP or Gravity.LEFT
+            textSize = 14f
+            setPadding(9, 5, 3, 2)
             setOnClickListener { action() }
         }
 
@@ -360,13 +391,13 @@ class MainActivity : Activity() {
             tab.settings.useWideViewPort = true
             tab.settings.loadWithOverviewMode = enabled
         }
-        if (::modeButton.isInitialized) modeButton.text = if (enabled) "Mode: Desktop" else "Mode: Mobile"
+        if (::modeButton.isInitialized) modeButton.text = if (enabled) "Desktop" else "Mobile"
         web.reload()
         status.text = if (enabled) "Desktop mode enabled" else "Mobile mode enabled"
     }
 
     private fun showSettings() {
-        val options = arrayOf("Zoom in", "Zoom out", "Reset zoom", "Desktop mode", "Mobile mode", "Clear browsing data")
+        val options = arrayOf("Zoom in", "Zoom out", "Reset zoom", "Desktop mode", "Mobile mode", "Search without images", "Disable JavaScript", "Clear browsing data")
         AlertDialog.Builder(this).setTitle("Settings").setItems(options) { _, which ->
             when (which) {
                 0 -> web.evaluateJavascript("document.body.style.zoom = (parseFloat(document.body.style.zoom || '1') + 0.1)", null)
@@ -374,7 +405,21 @@ class MainActivity : Activity() {
                 2 -> web.evaluateJavascript("document.body.style.zoom = '1'", null)
                 3 -> setDesktopMode(true)
                 4 -> setDesktopMode(false)
-                5 -> AlertDialog.Builder(this).setMessage("Clear cookies, cache and browsing history?")
+                5 -> {
+                    val enabled = !prefs.getBoolean("images_enabled", true)
+                    prefs.edit().putBoolean("images_enabled", enabled).apply()
+                    tabViews.forEach { it.settings.loadsImagesAutomatically = enabled }
+                    toast(if (enabled) "Images enabled" else "Image-free browsing enabled")
+                    web.reload()
+                }
+                6 -> {
+                    val enabled = !prefs.getBoolean("javascript_enabled", true)
+                    prefs.edit().putBoolean("javascript_enabled", enabled).apply()
+                    tabViews.forEach { it.settings.javaScriptEnabled = enabled }
+                    toast(if (enabled) "JavaScript enabled" else "JavaScript disabled; some sites may not work")
+                    web.reload()
+                }
+                7 -> AlertDialog.Builder(this).setMessage("Clear cookies, cache and browsing history?")
                     .setPositiveButton("Clear") { _, _ ->
                         CookieManager.getInstance().removeAllCookies(null)
                         web.clearCache(true); web.clearHistory()
@@ -420,11 +465,37 @@ class MainActivity : Activity() {
 
     private fun showUrlList(title: String, values: List<String>, open: Boolean) {
         if (values.isEmpty()) { toast("No items"); return }
-        AlertDialog.Builder(this).setTitle(title).setItems(values.toTypedArray()) { _, index ->
+        val labels = values.map { compactAddress(it) }
+        AlertDialog.Builder(this).setTitle(title).setItems(labels.toTypedArray()) { _, index ->
             if (open) web.loadUrl(values[index])
-            else AlertDialog.Builder(this).setMessage(values[index]).setPositiveButton("Open") { _, _ -> web.loadUrl(values[index]) }
+            else AlertDialog.Builder(this).setMessage(compactAddress(values[index])).setPositiveButton("Open") { _, _ -> web.loadUrl(values[index]) }
                 .setNegativeButton("Close", null).show()
         }.setNegativeButton("Close", null).show()
+    }
+
+    private fun compactAddress(value: String): String {
+        return try {
+            val uri = Uri.parse(value)
+            val host = uri.host ?: value
+            val path = uri.path.orEmpty().take(36)
+            (host + path).take(64)
+        } catch (_: Exception) { value.take(64) }
+    }
+
+    private fun pasteFromClipboard() {
+        val clipboard = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        val text = clipboard.primaryClip?.getItemAt(0)?.coerceToText(this)?.toString()
+        if (text.isNullOrEmpty()) { toast("Clipboard is empty"); return }
+        web.evaluateJavascript("""(function(){let e=document.activeElement;if(!e||!(e.isContentEditable||/^(TEXTAREA|INPUT)$/.test(e.tagName)))return 'NO_FIELD';e.focus();const v=${JSONObject.quote(text)};if(e.isContentEditable){document.execCommand('insertText',false,v);}else{const a=e.selectionStart??e.value.length,b=e.selectionEnd??e.value.length;e.setRangeText(v,a,b,'end');e.dispatchEvent(new Event('input',{bubbles:true}));}return 'PASTED';})()""") { r -> toast(if (r?.contains("PASTED") == true) "Pasted" else "Tap a text field first") }
+    }
+
+    private fun toggleFullScreen() {
+        fullScreen = !fullScreen
+        headerBar.visibility = if (fullScreen) View.GONE else View.VISIBLE
+        navBar.visibility = if (fullScreen) View.GONE else View.VISIBLE
+        bottomBar.visibility = if (fullScreen) View.GONE else View.VISIBLE
+        status.visibility = if (fullScreen) View.GONE else View.VISIBLE
+        window.decorView.systemUiVisibility = if (fullScreen) (View.SYSTEM_UI_FLAG_FULLSCREEN or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY) else View.SYSTEM_UI_FLAG_VISIBLE
     }
 
     private fun showDownloadsInfo() {
@@ -688,6 +759,7 @@ class MainActivity : Activity() {
     private val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 
     override fun onBackPressed() {
+        if (fullScreen) { toggleFullScreen(); return }
         if (web.canGoBack()) web.goBack()
         else if (tabViews.size > 1) closeTab(currentTab)
         else super.onBackPressed()

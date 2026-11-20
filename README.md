@@ -1,32 +1,14 @@
-# SlBrowser
+# SlBrowser — Version 1.4
 
-Android WebView browser project.
+Updates in this revision:
+- Replaced the horizontally scrolling second row with a fixed-width row of equally sized controls that fit the screen: Back, Forward, Past, Full Screen, History, Bookmarks, Downloads, and Mode.
+- Kept the horizontal page-progress indicator in a fixed 4dp slot so showing/hiding progress does not shift the home layout.
+- Reordered the bottom controls so File is immediately left of Answer, and Answer is at the far right.
+- Updated button labels to larger, top-left aligned text rather than centered text.
+- Added pinch-to-zoom for the web page, clamped between 60% and 100%.
+- Added Past (paste clipboard text into the currently focused web text field) and Full Screen controls.
+- Added persistent settings to browse without images and to disable/enable JavaScript. Disabling JavaScript can prevent some sites from working correctly.
+- Shortened History and Bookmark list labels to compact host/path text to avoid oversized URL strings; the original URL remains the navigation target.
+- Preserved the selected launcher icon asset.
 
-## Version 1.1 updates
-- Functional tab manager: create, switch, and close tabs; website pop-up windows open in a new tab.
-- Website file upload bridge: the File button activates the current page's file input and returns selected device files to the website.
-- Answer button attempts to activate the current website's Send/Submit control for the active or populated message editor; it no longer opens a separate message dialog.
-- Downloads button lists Download Manager items and opens Android's downloads screen.
-- Browser history, bookmarks, navigation, page text saving, desktop/mobile mode, zoom, and Auto Select are retained.
-- Launcher icon uses the selected blue globe/yellow orbit/cursor design (PNG asset is 44,191 bytes, below 50 KB).
-
-## Build
-The GitHub Actions workflow builds a debug APK on pushes to any branch and supports manual runs.
-
-## Version 1.2 bug fixes
-- Auto Select OFF now removes the page selection-mode class as well as its visual style, preventing ordinary page taps from opening the save-text dialog.
-- File opens Android's document picker even when the current website has no upload field; when a website file input exists, the selected URI is passed back to the website's upload control.
-- File chooser falls back to ACTION_GET_CONTENT if ACTION_OPEN_DOCUMENT is unavailable.
-
-## Version 1.3 updates
-- Added a main-screen mode selector for Mobile/Desktop website rendering.
-- File upload picker now requests multi-selection and forces the active website file input to accept multiple files.
-- Added a horizontal page-load progress bar.
-- Improved downloads with cookies, referer and user-agent headers, MIME detection, legacy storage permission handling, and an in-app downloads list/open action.
-
-## Version 1.3 feature details
-- Main navigation strip includes a Mobile/Desktop mode selector; the selection is saved and applied to every open tab.
-- Website file inputs are opened through Android's document picker with multi-select enabled. Selected URIs are returned to the website's WebView file chooser callback.
-- A horizontal loading progress bar shows page-load percentage and hides when loading completes.
-- Download handling now uses DownloadManager with session cookies, User-Agent and Referer headers, inferred MIME types, legacy Android storage permission handling, and direct handling for common downloadable file extensions.
-- Downloads panel can open completed files or the device Downloads screen.
+Build with the included GitHub Actions workflow. APK compilation was not run in this environment because Gradle is not installed.
